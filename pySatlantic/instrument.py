@@ -8,6 +8,7 @@ import csv
 from operator import itemgetter
 from datetime import datetime
 
+
 # Error Management
 class SatlanticInstrumentError(Exception):
     pass
@@ -56,7 +57,7 @@ class Calibration:
         get the calibration equations and coefficients
     """
 
-    CORE_VARIABLE_TYPES = ['LT', 'LI', 'ES', 'LT']
+    CORE_VARIABLE_TYPES = ['LT', 'LI', 'LU', 'ED', 'ES', 'EU']
 
     def __init__(self, cal_filename=None, immersed=False):
         # Metadata
@@ -64,6 +65,11 @@ class Calibration:
         self.sn = -999
         self.frame_header = ''
         self.immersed = immersed
+        self.frame_rate = None
+        self.baudrate = None
+        self.calibration_time = {}
+        self.calibration_temperature = None
+        self.thermal_response = []
         # Parsing variables
         self.key = []
         self.type = []
@@ -118,6 +124,12 @@ class Calibration:
           self.instrument <string> instrument name
           self.sn <string> instrument serial number
           self.frame_header <string> instrument frame header
+          self.immersed <bool> instrument is immersed in water (True) or in the air (False)
+          self.frame_rate <int> instrument expected frame rate
+          self.baudrate <int> instrument expected serial baud rate
+          self.calibration_time <dict> instrument calibration time
+          self.calibration_temperature <float> instrument calibration temperature
+          self.thermal_response <list> instrument thermal response coefficients
           self.key <list> concatenate variable type and variable id (if id is not None, otherwise same as type)
           self.type <list> variable names
           self.id <list> variable types
@@ -161,8 +173,7 @@ class Calibration:
                     continue
                 if lc[0:14] == 'VLF_INSTRUMENT':
                     # Special case used for variable length frame instruments
-                    self.instrument = lc[15:21]
-                    self.sn = int(lc[21:25])
+                    self.instrument = lc[15:25]
                     continue
                 # Variable frame length
                 if lc[0:5] == 'FIELD':
@@ -174,8 +185,28 @@ class Calibration:
                 if lc[0:4] == 'CRLF' or lc[0:10] == 'TERMINATOR':
                     # Skip terminator
                     continue
+                # Pseudo Sensors
+                if lc[0:4] == 'RATE':
+                    self.frame_rate = int(l.split()[1])
+                    continue
+                if lc[0:8] == 'DATARATE':
+                    self.baudrate = int(l.split()[1])
+                    continue
+                if lc[0:7] == 'CALTIME':
+                    ls = l.split()
+                    self.calibration_time[ls[1]] = float(ls[2][1:-1])
+                    continue
+                if lc[0:7] == 'CALTEMP':
+                    self.calibration_temperature = float(l.split()[1])
+                    continue
+                if lc[0:12] == 'THERMAL_RESP':
+                    # Get lines of coefficients corresponding to thermal response
+                    l = f.readline().strip().split()
+                    for c in l:
+                        self.thermal_response.append(float(c))
+                    continue
                 # Frame fields
-                ls = l.split()
+                ls = l.split('#')[0].split()
                 if len(ls) == 7:
                     # Get values from each line
                     self.type.append(ls[0])
@@ -204,7 +235,10 @@ class Calibration:
                 else:
                     raise CalibrationFileError('Cal Incomplete line')
             # Build frame header
-            self.frame_header = self.instrument + '%0*d' % (4, self.sn)
+            if self.sn == -999:
+                self.frame_header = self.instrument
+            else:
+                self.frame_header = self.instrument + '%0*d' % (4, self.sn)
             if not self.variable_frame_length:
                 # Build frame parser
                 self.frame_nfields = len(self.type)
@@ -237,8 +271,11 @@ class Calibration:
                     elif self.data_type[i] == 'BU' and self.field_length[i] == 4:
                         # unsigned integer 4 bytes
                         self.frame_fmt += 'I'
+                    elif self.data_type[i] == 'BF' and self.field_length[i] == 4:
+                        # float
+                        self.frame_fmt += 'f'
                     elif self.data_type[i] == 'BD' and self.field_length[i] == 8:
-                        # binary decimal
+                        # double float
                         self.frame_fmt += 'd'
                     else:
                         raise CalibrationFileError('Missing byte decoder ' +
@@ -252,15 +289,15 @@ class Calibration:
 
             # Group Variables
             self.core_variables = [i for i, (x, y) in enumerate(zip(self.type, self.fit_type))
-                                   if x in self.CORE_VARIABLE_TYPES and y != 'NONE']
+                                   if x.upper() in self.CORE_VARIABLE_TYPES and y != 'NONE']
             if self.core_variables:
                 self.core_groupname = '%s_%s' % (self.type[self.core_variables[0]], self.instrument)
             self.unusable_variables = [i for i, (x, y) in enumerate(zip(self.type, self.fit_type))
-                                       if x in self.CORE_VARIABLE_TYPES and y == 'NONE']
+                                       if x.upper() in self.CORE_VARIABLE_TYPES and y == 'NONE']
             if self.unusable_variables:
                 self.unusable_groupname = '%s_%s_RAW' % (self.type[self.core_variables[0]], self.instrument)
             self.auxiliary_variables = [i for i, (x, y) in enumerate(zip(self.type, self.fit_type)) if
-                                        x not in self.CORE_VARIABLE_TYPES]
+                                        x.upper() not in self.CORE_VARIABLE_TYPES]
 
             # Convert calibration coefficients to numpy array for fast computation
             if self.core_variables:
@@ -315,14 +352,17 @@ class Instrument:
         self.cal = dict()
 
         if filename is not None:
-            if isdir(filename):
-                self.read_calibration_dir(filename, immersed)
-            else:
-                _, ext = splitext(filename)
-                if ext in self.VALID_SIP_EXTENSIONS:
-                    self.read_sip_file(filename, immersed)
-                elif ext in self.VALID_CAL_EXTENSIONS:
-                    self.read_calibration_file(filename, immersed)
+            if type(filename) is not list:
+                filename = [filename]
+            for f in filename:
+                if isdir(f):
+                    self.read_calibration_dir(f, immersed)
+                else:
+                    _, ext = splitext(f)
+                    if ext in self.VALID_SIP_EXTENSIONS:
+                        self.read_sip_file(f, immersed)
+                    elif ext in self.VALID_CAL_EXTENSIONS:
+                        self.read_calibration_file(f, immersed)
 
     def read_calibration_file(self, filename, immersed=False):
         _, ext = splitext(filename)
@@ -397,8 +437,8 @@ class Instrument:
             # else:
             #     d = list(d)
             d = list(d)
+            aint = None
             # Loop through all the fields
-            # INTIME will be on the first iteration in case it is needed for OPTIC3
             for j in range(parser.frame_nfields):
                 # Decode ASCII
                 if parser.data_type[j] in ['AS', 'AI', 'AF']:
@@ -422,7 +462,8 @@ class Instrument:
                 elif parser.fit_type[j] == 'OPTIC3':
                     # Get INTTIME (need to be computed before)
                     # integration time of sensor sampling
-                    aint = d[parser.type.index('INTTIME')]
+                    if aint is None:
+                        aint = d[parser.type.index('INTTIME')]
                     # Get other coefs
                     a0 = parser.cal_coefs[j][0]
                     a1 = parser.cal_coefs[j][1]
@@ -436,7 +477,7 @@ class Instrument:
             d = dict(zip(parser.key, d))
         return d
 
-    def parse_frame(self, frame, flag_get_auxiliary_variables=False, flag_get_unusable_variables=False):
+    def parse_frame(self, frame, flag_get_auxiliary_variables=None, flag_get_unusable_variables=False):
         # get frame_header
         frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
         if not frame_header:
@@ -486,8 +527,8 @@ class Instrument:
                                                               parser.fit_type[parser.unusable_variables[0]],
                                                               parser.unusable_cal_coefs,
                                                               aint, parser.immersed)
-            # Auxiliary variables
-            if flag_get_auxiliary_variables:
+            # Auxiliary variables (default: off: if core_variables | on: if no core variables)
+            if (flag_get_auxiliary_variables is None and not parser.core_variables) or flag_get_auxiliary_variables:
                 for j in parser.auxiliary_variables:
                     d[parser.key[j]] = self._fit_data(rd[j], parser.fit_type[j], parser.cal_coefs[j], aint,
                                                       parser.immersed)
@@ -516,6 +557,12 @@ class Instrument:
             foo = 0
             for k in range(len(cal_coefs)):
                 foo += cal_coefs[k] * value ** k
+            return foo
+        elif fit_type == 'POLYF':
+            # Factored polynomial
+            foo = cal_coefs[0]
+            for k in range(1, len(cal_coefs)):
+                foo *= value - cal_coefs[k]
             return foo
         elif fit_type == 'OPTIC2':
             a0 = cal_coefs[0]
@@ -601,10 +648,11 @@ class SatViewRawToCSV(BinReader):
     def __init__(self, calibration_filename, raw_filename, immersed=False):
         # TODO handle instrument immersion coefficients
         # TODO handle auxiliary and unusable data
+        self.w = dict()
         self.frame_parsed = 0
+        self.missing_frame_header = []
         self.instrument = Instrument(calibration_filename, immersed)
         [filename, _] = splitext(raw_filename)
-        self.w = dict()
         for k, cal in self.instrument.cal.items():
             self.w[k] = CSVWriter()
             if cal.core_variables:
@@ -629,7 +677,10 @@ class SatViewRawToCSV(BinReader):
         try:
             [parsed_frame, frame_header] = self.instrument.parse_frame(frame)
         except FrameHeaderNotFoundError:
-            print('WARNING: Missing calibration file for: ' + repr(frame))
+            frame_header = frame[0:10].decode(self.instrument.ENCODING, self.instrument.UNICODE_HANDLING)
+            if frame_header not in self.missing_frame_header:
+                self.missing_frame_header.append(frame_header)
+                print('WARNING: Missing calibration file for: ' + frame_header)
             return
         if self.instrument.cal[frame_header].core_variables:
             data = next(iter(parsed_frame.values())).tolist()
@@ -637,10 +688,11 @@ class SatViewRawToCSV(BinReader):
         else:
             data = []
             for k in self.instrument.cal[frame_header].key:
-                if isinstance(parsed_frame[k], float):
-                    data.append('%.2f' % parsed_frame[k])
-                else:
-                    data.append(str(parsed_frame[k]))
+                if k in parsed_frame.keys():
+                    if isinstance(parsed_frame[k], float):
+                        data.append('%.2f' % parsed_frame[k])
+                    else:
+                        data.append(str(parsed_frame[k]))
         # Write data
         self.w[frame_header].write([timestamp] + data)
         self.frame_parsed += 1

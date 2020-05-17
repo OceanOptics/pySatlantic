@@ -9,9 +9,13 @@ This module provides a simple way to unpack binary messages from Satlantic instr
 
 
 ## Installation
-The package runs with python 3 and can be installed from the setup file:
+The package runs with python 3 and can be installed from the setup file or directly with pip.
 
+    # Installation through setup file
     python setup.py install
+    
+    # Installation through pip
+    pip install pySatlantic
 
 
 ## Convert binary files recorded with SatView to CSV
@@ -69,4 +73,4 @@ List of frames and associated calibration files tested:
     + SATXDZ
     + SATXLZ
 
-Some functionalities of the Satlantic protocol are not implemented. Please make a feature request (through the 'Issues' section of the GitHub repository).
+Some functionalities of the Satlantic protocol are not implemented. Please make a feature request if you would like to the support of specific sensors (through the 'Issues' section of the GitHub repository).

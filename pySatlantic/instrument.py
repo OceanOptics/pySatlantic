@@ -18,10 +18,6 @@ class FrameError(SatlanticInstrumentError):
     pass
 
 
-class FrameHeaderIncompleteError(FrameError):
-    pass
-
-
 class FrameHeaderNotFoundError(FrameError):
     pass
 
@@ -57,7 +53,7 @@ class Calibration:
         get the calibration equations and coefficients
     """
 
-    CORE_VARIABLE_TYPES = ['LT', 'LI', 'LU', 'ED', 'ES', 'EU']
+    CORE_VARIABLE_TYPES = ['LT', 'LI', 'LU', 'LD', 'LS', 'ED', 'ES', 'EU', 'EV', 'EF']
 
     def __init__(self, cal_filename=None, immersed=False):
         # Metadata
@@ -85,6 +81,8 @@ class Calibration:
         self.frame_nfields = 0
         self.frame_length = 0
         self.frame_fmt = '!'  # byte order is MSB (network ! works)
+        self.frame_terminator = None
+        self.check_sum_index = None
         # Variable groups (only for variable_frame_length)
         self.core_variables = []
         self.auxiliary_variables = []
@@ -175,16 +173,20 @@ class Calibration:
                     # Special case used for variable length frame instruments
                     self.instrument = lc[15:25]
                     continue
-                # Variable frame length
+                # Variable frame length separator
                 if lc[0:5] == 'FIELD':
                     self.variable_frame_length = True
-                    ls = l.split()
-                    self.field_separator.append(bytes(ls[2][1:-1], "ASCII").decode("unicode_escape"))
+                    self.field_separator.append(bytes(l.split()[2][1:-1], "ASCII").decode("unicode_escape"))
                     continue
-                # Terminator included in cal
-                if lc[0:4] == 'CRLF' or lc[0:10] == 'TERMINATOR':
-                    # Skip terminator
-                    continue
+                # Variable frame length terminator
+                if lc[0:10] == 'TERMINATOR':
+                    self.frame_terminator = bytes(l.split()[2][1:-1], "ASCII").decode("unicode_escape")
+                    if not self.frame_terminator and int(l.split()[3]) == 2:
+                        self.frame_terminator = '\r\n'
+                    if self.variable_frame_length:
+                        self.field_separator.append(self.frame_terminator)
+                if lc[0:4] == 'CRLF':
+                    self.frame_terminator = '\r\n'
                 # Pseudo Sensors
                 if lc[0:4] == 'RATE':
                     self.frame_rate = int(l.split()[1])
@@ -280,12 +282,14 @@ class Calibration:
                     else:
                         raise CalibrationFileError('Missing byte decoder ' +
                               str(self.data_type[i]) + str(self.field_length[i]))
-                # if force_terminator: DEPRECATED
-                #     # Add terminator at the end
-                #     # 2 bytes for carriage return (CR) and line feed (LF)
-                #     # This was required for HyperNav files
-                #     self.frame_fmt += 'H'  # 'H' -> 3338 or '2s' -> b'\r\n'
-                #     self.frame_length += 2
+
+            # End of check sum computation
+            if 'CHECK_SUM' in self.key:
+                self.check_sum_index = -self.field_length[self.key.index('CHECK_SUM')]
+                if 'TERMINATOR' in self.id:
+                    self.check_sum_index -= self.field_length[self.id.index('TERMINATOR')]
+                elif 'TERMINATOR' in self.type:
+                    self.check_sum_index -= self.field_length[self.type.index('TERMINATOR')]
 
             # Group Variables
             self.core_variables = [i for i, (x, y) in enumerate(zip(self.type, self.fit_type))
@@ -394,11 +398,10 @@ class Instrument:
         # DEPRECATED (different output and slower as treat each wavelength individually)
         # get frame_header
         frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
-        if not frame_header:
-            raise FrameHeaderIncompleteError('Unable to resolve frame header in ' + str(frame))
-        if frame_header not in self.cal.keys():
+        try:
+            parser = self.cal[frame_header]
+        except KeyError:
             raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files.')
-        parser = self.cal[frame_header]
         if parser.variable_frame_length:
             # Variable length frame
             d = dict()
@@ -437,6 +440,9 @@ class Instrument:
             # else:
             #     d = list(d)
             d = list(d)
+            # Skip Terminator
+            if 'TERMINATOR' in parser.id:
+                del d[parser.id.index('TERMINATOR')]
             aint = None
             # Loop through all the fields
             for j in range(parser.frame_nfields):
@@ -477,37 +483,76 @@ class Instrument:
             d = dict(zip(parser.key, d))
         return d
 
+    def check_frame(self, frame):
+        """
+        Check completeness of frame, recommended to run before parsing
+        :param frame:
+        :return: empty string when pass check, one word otherwise indicating the source of the problem
+        """
+        # Check frame length
+        if len(frame) < 10:
+            return 'short'
+        # Check frame header
+        frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
+        if frame_header not in self.cal.keys():
+            if frame_header[:6] == 'SATHDR':
+                # Exception for Header Frame Recorded by SatView
+                return ''
+            # Option 1: unknown frame header
+            # Option 2: Poor parsing
+            return 'unknown'
+        # Check frame consistent with parser description
+        parser = self.cal[frame_header]
+        if parser.variable_frame_length:
+            # Check Terminator
+            if frame[-len(parser.frame_terminator):].decode("unicode_escape") == parser.frame_terminator:
+                return ''
+            else:
+                return 'terminator'
+        else:
+            # Check Size & Frame Terminator if one
+            if parser.frame_length == len(frame[10:]):
+                if not parser.frame_terminator:
+                    return ''
+                elif frame[-len(parser.frame_terminator):].decode("unicode_escape") == parser.frame_terminator:
+                    return ''
+                else:
+                    return 'terminator'
+            elif parser.frame_length > len(frame[10:]):
+                return 'short'
+            elif parser.frame_length < len(frame[10:]):
+                return 'long'
+
+
     def parse_frame(self, frame, flag_get_auxiliary_variables=None, flag_get_unusable_variables=False):
         # get frame_header
         frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
-        if not frame_header:
-            raise FrameHeaderIncompleteError('Unable to resolve frame header in ' + str(frame))
-        if frame_header not in self.cal.keys():
+        try:
+            parser = self.cal[frame_header]
+        except KeyError:
             raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files.')
-        parser = self.cal[frame_header]
         if parser.variable_frame_length:
+            valid_frame = True
             # Variable length frame
             d = dict()
             # Decode value of each field
             frame = frame[11:].decode(self.ENCODING, self.UNICODE_HANDLING) # skip first value separator (comma)
-            for k, s, t in zip(parser.key[0:-1], parser.field_separator[1:], parser.data_type):
+            for k, s, t in zip(parser.key[:-1], parser.field_separator[1:], parser.data_type[:-1]):
                 index_sep = frame.find(s)
+                if index_sep == -1:
+                    valid_frame = False
+                    continue
                 d[k] = self._decode_ascii_data(frame[0:index_sep], t, force_ascii=True)
                 frame = frame[index_sep + 1:]
-            # Decode last field
-            d[parser.key[-1]] = self._decode_ascii_data(frame, parser.data_type[-1], force_ascii=True)
         else:
             # Fixed length frame
             # Decode binary data
             if parser.frame_length != len(frame[10:]):
-                raise FrameLengthError('Unexpected frame length: %s is %d instead of %d.' %
+                raise FrameLengthError('Unexpected frame length: %s expected %d actual %d.' %
                                        (frame_header, parser.frame_length, len(frame[10:])))
             rd = unpack(parser.frame_fmt, frame[10:])
             # Decode ASCII variables
             rd = [self._decode_ascii_data(v, t) for v, t in zip(rd, parser.data_type)]
-            # if self.include_terminator:
-            #     # Remove terminator that was included up to now(\r\n)
-            #     rd = rd[0:-1]
             # Get integration time if available as required from OPTIC3 fit
             if 'INTTIME' in parser.type:
                 i = parser.type.index('INTTIME')
@@ -527,13 +572,28 @@ class Instrument:
                                                               parser.fit_type[parser.unusable_variables[0]],
                                                               parser.unusable_cal_coefs,
                                                               aint, parser.immersed)
+
             # Auxiliary variables (default: off: if core_variables | on: if no core variables)
             if (flag_get_auxiliary_variables is None and not parser.core_variables) or flag_get_auxiliary_variables:
+                valid_frame = True
                 for j in parser.auxiliary_variables:
+                    # Special case of frame terminator
+                    if parser.key[j] == 'CRLF_TERMINATOR':
+                        if rd[j] != 3338:  # unpack('!H', b'\r\n') as data type in calibration file is BU
+                            valid_frame = False
+                        continue
+                    elif parser.type[j] == 'TERMINATOR':
+                        if rd[j] != parser.frame_terminator:
+                            valid_frame = False
+                        continue
+                    elif parser.key[j] == 'CHECK_SUM':
+                        if rd[j] != self._compute_check_sum(frame, parser.check_sum_index):
+                            valid_frame = False
                     d[parser.key[j]] = self._fit_data(rd[j], parser.fit_type[j], parser.cal_coefs[j], aint,
                                                       parser.immersed)
-
-        return d, frame_header
+            else:
+                valid_frame = None
+        return d, frame_header, valid_frame
 
     def _decode_ascii_data(self, value, data_type, force_ascii=False):
         if data_type in ['AS', 'AI', 'AF']:
@@ -583,42 +643,18 @@ class Instrument:
         else:
             raise ParserFitError("Parser fit type not supported '" + fit_type + "'")
 
+    @staticmethod
+    def _compute_check_sum(frame, check_sum_index=-3):
+        # Last byte of the sum of all bytes substracted from 0
+        #   from frame header (included) to checksum (excluded)
+        return np.uint8(0-sum(frame[0:check_sum_index]))
+
+
     def __str__(self):
         foo = ""
         for c in self.cal.values():
             foo += str(c)
         return foo
-
-
-class BinReader:
-    REGISTRATION = b'SAT'
-    READ_SIZE = 1024
-
-    def __init__(self, filename=None):
-        self.buffer = bytearray()
-        if filename:
-            self.run(filename)
-
-    def run(self, filename):
-        with open(filename, 'rb') as f:
-            data = f.read(self.READ_SIZE)
-            while data:
-                self.data_read(data)
-                data = f.read(self.READ_SIZE)
-            self.handle_last_frame(self.REGISTRATION + self.buffer)
-
-    def data_read(self, data):
-        self.buffer.extend(data)
-        while self.REGISTRATION in self.buffer:
-            frame, self.buffer = self.buffer.split(self.REGISTRATION, 1)
-            if frame:
-                self.handle_frame(self.REGISTRATION + frame)
-
-    def handle_frame(self, frame):
-        raise NotImplementedError('Implement functionality in handle packet')
-
-    def handle_last_frame(self, frame):
-        return self.handle_frame(frame)
 
 
 class CSVWriter:
@@ -641,50 +677,110 @@ class CSVWriter:
             self.f.close()
 
 
-class SatViewRawToCSV(BinReader):
+class SatViewRawToCSV:
 
-    FRAME_TERMINATOR = b'\r\n'
+    REGISTRATION = b'SAT'
+    READ_SIZE = 1024
 
-    def __init__(self, calibration_filename, raw_filename, immersed=False):
-        # TODO handle instrument immersion coefficients
-        # TODO handle auxiliary and unusable data
-        self.w = dict()
-        self.frame_parsed = 0
-        self.missing_frame_header = []
+    def __init__(self, calibration_filename, raw_filename=None, immersed=False):
         self.instrument = Instrument(calibration_filename, immersed)
+        self.buffer = bytearray()
+        self.frame_buffer = bytearray()
+        self.w = dict()
+        self.frame_received = 0
+        self.frame_parsed = 0
+        self.frame_unregistered = 0
+        self.missing_frame_header = []
         [filename, _] = splitext(raw_filename)
         for k, cal in self.instrument.cal.items():
             self.w[k] = CSVWriter()
+            disp_key = cal.key.copy()
+            disp_aux_var = cal.auxiliary_variables.copy()
+            if 'TERMINATOR' in cal.key:
+                del disp_aux_var[disp_aux_var.index(disp_key.index('TERMINATOR'))]
+                del disp_key[disp_key.index('TERMINATOR')]
+            elif 'CRLF_TERMINATOR' in cal.key:
+                del disp_aux_var[disp_aux_var.index(disp_key.index('CRLF_TERMINATOR'))]
+                del disp_key[disp_key.index('CRLF_TERMINATOR')]
             if cal.core_variables:
-                fieldnames = ['TIMESTAMP'] + list(itemgetter(*cal.core_variables)(cal.key))
+                fieldnames = ['TIMESTAMP'] + list(itemgetter(*cal.core_variables)(disp_key)) +\
+                             list(itemgetter(*disp_aux_var)(disp_key))
             else:
-                fieldnames = ['TIMESTAMP'] + cal.key
+                fieldnames = ['TIMESTAMP'] + disp_key
             self.w[k].open(filename + '_' + k + '.csv', fieldnames)
-        super(SatViewRawToCSV, self).__init__(raw_filename)
+        if raw_filename:
+            self.run(raw_filename)
+
+    def run(self, filename):
+        with open(filename, 'rb') as f:
+            data = f.read(self.READ_SIZE)
+            while data:
+                self.data_read(data)
+                data = f.read(self.READ_SIZE)
+            self.handle_last_frame(self.REGISTRATION + self.buffer)
+
+    def data_read(self, data):
+        self.buffer.extend(data)
+        while self.REGISTRATION in self.buffer:
+            frame, tmp = self.buffer.split(self.REGISTRATION, 1)
+            if self.frame_buffer:
+                frame = self.frame_buffer + self.REGISTRATION + frame
+                self.frame_buffer = None
+            if len(frame) > 10:
+                # Check frame without satview timestamp which would be the 7 last bytes
+                fail = self.instrument.check_frame(self.REGISTRATION + frame[:-7])
+                if not fail:
+                    self.handle_frame(self.REGISTRATION + frame)
+                    self.buffer = tmp
+                elif fail == 'short':
+                    self.frame_buffer = frame
+                    self.buffer = tmp
+                else:
+                    self.buffer = tmp
+                    print('WARNING: Unable to register data.')
+                    self.frame_unregistered += 1
+            else:
+                self.buffer = tmp
 
     def handle_frame(self, frame):
-        try:
-            [frame, timestamp] = frame.split(self.FRAME_TERMINATOR)
-        except ValueError:
-            return
-        # Skip frame header
+        # Skip header frames
         if frame[:6] == b'SATHDR':
             return
-        # Decode SatView timestamp
+        self.frame_received += 1
+        # Assume data recorded with SatView (timestamp appended as last 7 bytes of frame)
+        timestamp = frame[-7:]
+        frame = frame[:-7]
         d = unpack('!ii', b'\x00' + timestamp)
-        timestamp = datetime.strptime(str(d[0]) + str(d[1]) + '000', '%Y%j%H%M%S%f').strftime('%Y/%m/%d %H:%M:%S.%f')[:-3]
+        try:
+            timestamp = datetime.strptime(str(d[0]) + str(d[1]) + '000', '%Y%j%H%M%S%f').strftime('%Y/%m/%d %H:%M:%S.%f')[:-3]
+        except ValueError:
+            print('WARNING: Time Impossible, frame likely corrupted.')
+            timestamp = 'NaN'
+
         # Decode frame data
         try:
-            [parsed_frame, frame_header] = self.instrument.parse_frame(frame)
+            [parsed_frame, frame_header, valid_frame] = self.instrument.parse_frame(frame, True)
         except FrameHeaderNotFoundError:
             frame_header = frame[0:10].decode(self.instrument.ENCODING, self.instrument.UNICODE_HANDLING)
             if frame_header not in self.missing_frame_header:
                 self.missing_frame_header.append(frame_header)
                 print('WARNING: Missing calibration file for: ' + frame_header)
             return
+        except FrameLengthError as e:
+            print(e)
+            return
+        if valid_frame:
+            self.frame_parsed += 1
+        # Write data
         if self.instrument.cal[frame_header].core_variables:
             data = next(iter(parsed_frame.values())).tolist()
             data = ["%.10f" % v for v in data]
+            for k in [k for i, k in enumerate(self.instrument.cal[frame_header].key) if i in self.instrument.cal[frame_header].auxiliary_variables]:
+                if k in parsed_frame.keys():
+                    if isinstance(parsed_frame[k], float):
+                        data.append('%.2f' % parsed_frame[k])
+                    else:
+                        data.append(str(parsed_frame[k]))
         else:
             data = []
             for k in self.instrument.cal[frame_header].key:
@@ -693,9 +789,10 @@ class SatViewRawToCSV(BinReader):
                         data.append('%.2f' % parsed_frame[k])
                     else:
                         data.append(str(parsed_frame[k]))
-        # Write data
         self.w[frame_header].write([timestamp] + data)
-        self.frame_parsed += 1
+
+    def handle_last_frame(self, frame):
+        return self.handle_frame(frame)
 
     def __del__(self):
         for k in self.w.keys():

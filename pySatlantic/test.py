@@ -45,8 +45,8 @@ class TestHyperSASFunctions(unittest.TestCase):
     def test_read_frame_variable_length(self):
         from pySatlantic import instrument
         i = instrument.Instrument(TEST_CALIBRATION_SIP_FILE)
-        [d, frame_header, valid] = i.parse_frame(TEST_FRAME_VARIABLE_LENGTH)
-        self.assertEqual(frame_header, 'SATTHS0009')
+        [d, valid] = i.parse_frame(TEST_FRAME_VARIABLE_LENGTH)
+        # self.assertEqual(frame_header, 'SATTHS0009')
         self.assertEqual(d['FRAME_COUNTER'], 44)
         self.assertEqual(d['TIMER'], 2338.48)
         self.assertEqual(d['START'], '$')
@@ -73,8 +73,9 @@ class TestHyperSASFunctions(unittest.TestCase):
             else:
                 self.assertEqual(d_v0[k], TEST_FRAME_FIXED_LENGTH_DICT_v0[k])
         # Test current version
-        d, frame_header, valid = i.parse_frame(TEST_FRAME_FIXED_LENGTH, True, True)
-        self.assertEqual(frame_header, 'SATHSL0251')
+        d, valid = i.parse_frame(TEST_FRAME_FIXED_LENGTH,\
+                                 flag_get_auxiliary_variables=True, flag_get_unusable_variables=True)
+        # self.assertEqual(frame_header, 'SATHSL0251')
         self.assertCountEqual(d, TEST_FRAME_FIXED_LENGTH_DICT)
         for k in d.keys():
             if isinstance(d[k], np.ndarray):
@@ -97,17 +98,17 @@ class TestHyperSASFunctions(unittest.TestCase):
         for f in frames:
             if f[1]:
                 frame = b'SATTHS0009' + f[1]
-            if f[2]:
+                data = i.parse_frame(frame + b'\x0D\x0A', 'SATTHS0009', True, True)
+            elif f[2]:
                 frame = b'SATHSL0251' + f[2]
-            if f[3]:
+                data = i.parse_frame(frame + b'\x0D\x0A', 'SATHSL0251', True, True)
+            elif f[3]:
                 frame = b'SATHSL0250' + f[3]
-            if f[1] is None and f[2] is None and f[3] is None:
-                no_frame_count += 1
+                data = i.parse_frame(frame + b'\x0D\x0A', 'SATHSL0250', True, True)
             else:
-                # data = i.parse_frame_v0(frame)
-                data = i.parse_frame(frame + b'\x0D\x0A', True, True)
-                if data:
-                    valid_frame_count += 1
+                no_frame_count += 1
+            if data:
+                valid_frame_count += 1
         self.assertEqual(valid_frame_count, 10000)
         self.assertEqual(no_frame_count, 0)
 

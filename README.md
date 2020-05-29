@@ -41,6 +41,7 @@ optional arguments:
 ## Integrate in other software
 The class `Instrument` provides key methods to handle the binary frames from Satlantic instruments
 * `read_calibration_file`/`read_calibration_dir`/`read_sip_file`: Parse calibration file(s) needed to unpack and calibrate binary frames.
+* `find_frame`: Find known frame in a binary array
 * `parse_frame`: Unpack binary frame and apply calibration fit to convert data in scientific units
 
 The class `Instrument` support the immersed flag for each sensor independently. The immersion flag is accessible through `Instrument.cal[<frame_header>].immersed` with `frame_header` being the sensor to be immersed or not.

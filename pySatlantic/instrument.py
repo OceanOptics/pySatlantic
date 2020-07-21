@@ -873,7 +873,7 @@ class SatViewRawToCSV:
                       i in self.instrument.cal[frame_header].auxiliary_variables]:
                 if k in parsed_frame.keys():
                     if isinstance(parsed_frame[k], float):
-                        data.append('%.2f' % parsed_frame[k])
+                        data.append('%.4f' % parsed_frame[k])
                     else:
                         data.append(str(parsed_frame[k]))
         else:
@@ -881,7 +881,7 @@ class SatViewRawToCSV:
             for k in self.instrument.cal[frame_header].key:
                 if k in parsed_frame.keys():
                     if isinstance(parsed_frame[k], float):
-                        data.append('%.2f' % parsed_frame[k])
+                        data.append('%.4f' % parsed_frame[k])
                     else:
                         data.append(str(parsed_frame[k]))
         self.w[frame_header].write([timestamp] + data)

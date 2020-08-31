@@ -46,6 +46,10 @@ class CalibrationFileExtensionError(CalibrationFileError):
     pass
 
 
+class CalibrationFileEmptyError(CalibrationFileError):
+    pass
+
+
 class Calibration:
     """
     Calibration class for parsing single calibration files
@@ -381,6 +385,8 @@ class Instrument:
                         self.read_sip_file(f, immersed)
                     elif ext in self.VALID_CAL_EXTENSIONS:
                         self.read_calibration_file(f, immersed)
+                    else:
+                        raise CalibrationFileExtensionError('File extension incorrect')
 
     def read_calibration_file(self, filename, immersed=False):
         _, ext = splitext(filename)
@@ -389,27 +395,35 @@ class Instrument:
             self.cal[foo.frame_header] = foo
             self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
         else:
-            raise CalibrationFileExtensionError('Calibration file extension incorrect.')
+            raise CalibrationFileExtensionError('File extension incorrect')
 
     def read_calibration_dir(self, dirname, immersed=False):
+        empty_dir = True
         for fn in listdir(dirname):
             if isfile(join(dirname, fn)):
                 _, ext = splitext(fn)
                 if ext in self.VALID_CAL_EXTENSIONS:
+                    empty_dir = False
                     foo = Calibration(join(dirname, fn), immersed)
                     self.cal[foo.frame_header] = foo
                     self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
+        if empty_dir:
+            raise CalibrationFileEmptyError('No calibration file found in directory')
 
     def read_sip_file(self, filename, immersed=False):
+        empty_sip = True
         archive = zipfile.ZipFile(filename, 'r')
         dirsip = dirname(filename)
         archive.extractall(path=dirsip)
         for fn in archive.namelist():
             _, ext = splitext(fn)
             if ext in self.VALID_CAL_EXTENSIONS:
+                empty_sip = False
                 foo = Calibration(join(dirsip, fn), immersed)
                 self.cal[foo.frame_header] = foo
                 self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
+        if empty_sip:
+            raise CalibrationFileEmptyError('No calibration file found in sip')
 
     def parse_frame_v0(self, frame):
         # DEPRECATED (different output and slower as treat each wavelength individually)
@@ -418,7 +432,7 @@ class Instrument:
         try:
             parser = self.cal[frame_header]
         except KeyError:
-            raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files.')
+            raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files')
         if parser.variable_frame_length:
             # Variable length frame
             d = dict()
@@ -601,7 +615,7 @@ class Instrument:
                 frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
             parser = self.cal[frame_header]
         except KeyError:
-            raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files.')
+            raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files')
         if parser.variable_frame_length:
             valid_frame = True
             # Variable length frame
@@ -619,7 +633,7 @@ class Instrument:
             # Fixed length frame
             # Decode binary data
             if parser.frame_length != len(frame):
-                raise FrameLengthError('Unexpected frame length: %s expected %d actual %d.' %
+                raise FrameLengthError('Unexpected frame length: %s expected %d actual %d' %
                                        (frame_header, parser.frame_length, len(frame)))
             rd = unpack(parser.frame_fmt, frame[10:])
             # Decode ASCII variables
@@ -678,7 +692,7 @@ class Instrument:
                 return float(foo)
             return foo
         elif force_ascii:
-            raise ParserDecodeError('Non ASCII data type ' + data_type + '.')
+            raise ParserDecodeError('Non ASCII data type ' + data_type)
         return value
 
     @staticmethod

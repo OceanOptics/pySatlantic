@@ -73,5 +73,7 @@ List of frames and associated calibration files tested:
   + HyperNav
     + SATXDZ
     + SATXLZ
+    + SATXCZ
+    + SATYCZ
 
 Some functionalities of the Satlantic protocol are not implemented. Please make a feature request if you would like to the support of specific sensors (through the 'Issues' section of the GitHub repository).

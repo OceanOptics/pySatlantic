@@ -7,6 +7,7 @@ import numpy as np
 import csv
 from operator import itemgetter
 from datetime import datetime
+import warnings
 
 
 # Error Management
@@ -50,6 +51,87 @@ class CalibrationFileEmptyError(CalibrationFileError):
     pass
 
 
+def sat_dtype_to_np_dtype(sat_data_type, sat_field_length):
+    if sat_data_type == 'AS':
+        # ASCII string (text)
+        if sat_field_length:
+            return f'<{sat_field_length}U'
+        else:
+            # Assume maximum size of 12 characters
+            return f'<12U'
+    elif sat_data_type == 'AI':
+        # ASCII integer number
+        return np.int32
+    elif sat_data_type == 'AF':
+        # ASCII floating point number
+        return np.float32
+    elif sat_data_type == 'BS' and sat_field_length == 1:
+        # signed short 1 byte
+        return np.int8
+    elif sat_data_type == 'BU' and sat_field_length == 1:
+        # unsigned short 1 byte
+        return np.uint8
+    elif sat_data_type == 'BS' and sat_field_length == 2:
+        # signed short 2 bytes
+        return np.int16
+    elif sat_data_type == 'BU' and sat_field_length == 2:
+        # unsigned short 2 bytes
+        return np.uint16
+    elif sat_data_type == 'BS' and sat_field_length == 4:
+        # signed integer 4 bytes
+        return np.int32
+    elif sat_data_type == 'BU' and sat_field_length == 4:
+        # unsigned integer 4 bytes
+        return np.uint32
+    elif sat_data_type == 'BF' and sat_field_length == 4:
+        # float
+        return np.float32
+    elif sat_data_type == 'BD' and sat_field_length == 8:
+        # double float
+        return np.float64
+    else:
+        raise CalibrationFileError(f'Unknown format decoder {sat_data_type}{sat_field_length}')
+
+
+def sat_dtype_to_struct_format(sat_data_type, sat_field_length):
+    if sat_field_length is None:
+        raise CalibrationFileError('Field length must be an integer for fix length frames.')
+    if sat_data_type == 'AS':
+        # ASCII string (text)
+        return str(sat_field_length) + 's'
+    elif sat_data_type == 'AI':
+        # ASCII integer number
+        return str(sat_field_length) + 's'
+    elif sat_data_type == 'AF':
+        # ASCII floating point number
+        return str(sat_field_length) + 's'
+    elif sat_data_type == 'BS' and sat_field_length == 1:
+        # signed short 1 byte
+        return 'b'
+    elif sat_data_type == 'BU' and sat_field_length == 1:
+        # unsigned short 1 byte
+        return 'B'
+    elif sat_data_type == 'BS' and sat_field_length == 2:
+        # signed short 2 bytes
+        return 'h'
+    elif sat_data_type == 'BU' and sat_field_length == 2:
+        # unsigned short 2 bytes
+        return 'H'
+    elif sat_data_type == 'BS' and sat_field_length == 4:
+        # signed integer 4 bytes
+        return 'i'
+    elif sat_data_type == 'BU' and sat_field_length == 4:
+        # unsigned integer 4 bytes
+        return 'I'
+    elif sat_data_type == 'BF' and sat_field_length == 4:
+        # float
+        return 'f'
+    elif sat_data_type == 'BD' and sat_field_length == 8:
+        # double float
+        return 'd'
+    else:
+        raise CalibrationFileError(f'Unknown byte decoder {sat_data_type} {sat_field_length}')
+
 class Calibration:
     """
     Calibration class for parsing single calibration files
@@ -70,6 +152,9 @@ class Calibration:
         self.baudrate = None
         self.calibration_time = {}
         self.calibration_temperature = None
+        self.calibration_dark_average = None
+        self.response_temperature = None
+        self.response_dark_average = None
         self.thermal_response = []
         # Parsing variables
         self.key = []
@@ -133,6 +218,9 @@ class Calibration:
           self.baudrate <int> instrument expected serial baud rate
           self.calibration_time <dict> instrument calibration time
           self.calibration_temperature <float> instrument calibration temperature
+          self.calibration_dark_average <float> instrument average calibration dark
+          self.response_temperature <string> instrument thermal response type for correction
+          self.response_dark_average <string> instrument average dark response for correction
           self.thermal_response <list> instrument thermal response coefficients
           self.key <list> concatenate variable type and variable id (if id is not None, otherwise same as type)
           self.type <list> variable names
@@ -219,8 +307,19 @@ class Calibration:
                     ls = lc.split()
                     self.calibration_time[ls[1]] = float(ls[2][1:-1])
                     continue
-                if lc[0:7] == 'CALTEMP':
+                if lc[0:7] == 'CALTEMP' or lc[0:13] == 'CAL_SPEC_TEMP':
                     self.calibration_temperature = float(lc.split()[1])
+                    continue
+                if lc[0:13] == 'CAL_DARK_AVER':
+                    self.calibration_dark_average = float(lc.split()[1])
+                    continue
+                if lc[0:13] == 'RSP_SPEC_TEMP':
+                    self.response_temperature = lc.split()[6]
+                    warnings.warn("RSP_SPEC_TEMP not supported")
+                    continue
+                if lc[0:13] == 'RSP_DARK_AVER':
+                    self.response_dark_average = lc.split()[6]
+                    warnings.warn("RSP_DARK_AVER not supported")
                     continue
                 if lc[0:12] == 'THERMAL_RESP':
                     # Get lines of coefficients corresponding to thermal response
@@ -239,8 +338,15 @@ class Calibration:
                     else:
                         self.key.append(ls[0])
                     self.units.append(ls[2][1:-1])  # rm initial and final '
-                    if not self.variable_frame_length:
+                    try:
                         self.field_length.append(int(ls[3]))
+                    except ValueError as e:
+                        if self.variable_frame_length:
+                            # Special case of variable field length is accepted for variable length frame
+                            self.field_length.append(None)
+                        else:
+                            # Fixed length frame must have a valid field length
+                            raise e
                     self.data_type.append(ls[4])
                     self.cal_nlines.append(int(ls[5]))
                     self.fit_type.append(ls[6])
@@ -263,45 +369,10 @@ class Calibration:
                 self.frame_nfields = len(self.type)
                 for i in range(self.frame_nfields):
                     self.frame_length += self.field_length[i]
-                    if self.data_type[i] == 'AS':
-                        # ASCII string (text)
-                        self.frame_fmt += str(self.field_length[i]) + 's'
-                    elif self.data_type[i] == 'AI':
-                        # ASCII integer number
-                        self.frame_fmt += str(self.field_length[i]) + 's'
-                    elif self.data_type[i] == 'AF':
-                        # ASCII floating point number
-                        self.frame_fmt += str(self.field_length[i]) + 's'
-                    elif self.data_type[i] == 'BS' and self.field_length[i] == 1:
-                        # signed short 2 bytes
-                        self.frame_fmt += 'b'
-                    elif self.data_type[i] == 'BU' and self.field_length[i] == 1:
-                        # unsigned short 2 bytes
-                        self.frame_fmt += 'B'
-                    elif self.data_type[i] == 'BS' and self.field_length[i] == 2:
-                        # signed short 2 bytes
-                        self.frame_fmt += 'h'
-                    elif self.data_type[i] == 'BU' and self.field_length[i] == 2:
-                        # unsigned short 2 bytes
-                        self.frame_fmt += 'H'
-                    elif self.data_type[i] == 'BS' and self.field_length[i] == 4:
-                        # signed integer 4 bytes
-                        self.frame_fmt += 'i'
-                    elif self.data_type[i] == 'BU' and self.field_length[i] == 4:
-                        # unsigned integer 4 bytes
-                        self.frame_fmt += 'I'
-                    elif self.data_type[i] == 'BF' and self.field_length[i] == 4:
-                        # float
-                        self.frame_fmt += 'f'
-                    elif self.data_type[i] == 'BD' and self.field_length[i] == 8:
-                        # double float
-                        self.frame_fmt += 'd'
-                    else:
-                        raise CalibrationFileError('Missing byte decoder ' +
-                                                   str(self.data_type[i]) + str(self.field_length[i]))
+                    self.frame_fmt += sat_dtype_to_struct_format(self.data_type[i], self.field_length[i])
 
             # End of check sum computation
-            if 'CHECK_SUM' in self.key:
+            if not self.variable_frame_length and 'CHECK_SUM' in self.key:
                 self.check_sum_index = -self.field_length[self.key.index('CHECK_SUM')]
                 if 'TERMINATOR' in self.id:
                     self.check_sum_index -= self.field_length[self.id.index('TERMINATOR')]
@@ -312,11 +383,11 @@ class Calibration:
             self.core_variables = [i for i, (x, y) in enumerate(zip(self.type, self.fit_type))
                                    if x.upper() in self.CORE_VARIABLE_TYPES and y != 'NONE']
             if self.core_variables:
-                self.core_groupname = '%s_%s' % (self.type[self.core_variables[0]], self.instrument)
+                self.core_groupname = f'{self.type[self.core_variables[0]]}'
             self.unusable_variables = [i for i, (x, y) in enumerate(zip(self.type, self.fit_type))
                                        if x.upper() in self.CORE_VARIABLE_TYPES and y == 'NONE']
             if self.unusable_variables:
-                self.unusable_groupname = '%s_%s_RAW' % (self.type[self.core_variables[0]], self.instrument)
+                self.unusable_groupname = f'{self.type[self.core_variables[0]]}_RAW'
             self.auxiliary_variables = [i for i, (x, y) in enumerate(zip(self.type, self.fit_type)) if
                                         x.upper() not in self.CORE_VARIABLE_TYPES]
 
@@ -426,6 +497,7 @@ class Instrument:
             raise CalibrationFileEmptyError('No calibration file found in sip')
 
     def parse_frame_v0(self, frame):
+        warnings.warn("deprecated method", DeprecationWarning)
         # DEPRECATED (different output and slower as treat each wavelength individually)
         # get frame_header
         frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
@@ -617,17 +689,16 @@ class Instrument:
         except KeyError:
             raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files')
         if parser.variable_frame_length:
-            valid_frame = True
             # Variable length frame
-            d = dict()
+            rd = list()
             # Decode value of each field
             frame = frame[11:].decode(self.ENCODING, self.UNICODE_HANDLING)  # skip first value separator (comma)
-            for k, s, t in zip(parser.key[:-1], parser.field_separator[1:], parser.data_type[:-1]):
+            for s, t in zip(parser.field_separator[1:], parser.data_type[:-1]):
                 index_sep = frame.find(s)
                 if index_sep == -1:
                     valid_frame = False
                     continue
-                d[k] = self._decode_ascii_data(frame[0:index_sep], t, force_ascii=True)
+                rd.append(self._decode_ascii_data(frame[0:index_sep], t, force_ascii=True))
                 frame = frame[index_sep + 1:]
         else:
             # Fixed length frame
@@ -638,52 +709,54 @@ class Instrument:
             rd = unpack(parser.frame_fmt, frame[10:])
             # Decode ASCII variables
             rd = [self._decode_ascii_data(v, t) for v, t in zip(rd, parser.data_type)]
-            # Get integration time if available as required from OPTIC3 fit
-            if 'INTTIME' in parser.type:
-                i = parser.type.index('INTTIME')
-                aint = self._fit_data(rd[i], parser.fit_type[i], parser.cal_coefs[i], immersed=parser.immersed)
-            else:
-                aint = None
-            # Core Variables (same data and fit types, serialize process in numpy)
-            if parser.core_variables:
-                d = {parser.core_groupname: self._fit_data(np.array(itemgetter(*parser.core_variables)(rd)),
-                                                           parser.fit_type[parser.core_variables[0]],
-                                                           parser.core_cal_coefs, aint, parser.immersed)}
-            else:
-                d = dict()
-            # Unusable Variables (same data and fit types, serialize process in numpy)
-            if flag_get_unusable_variables:
-                d[parser.unusable_groupname] = self._fit_data(np.array(itemgetter(*parser.unusable_variables)(rd)),
-                                                              parser.fit_type[parser.unusable_variables[0]],
-                                                              parser.unusable_cal_coefs,
-                                                              aint, parser.immersed)
-
-            # Auxiliary variables (default: off: if core_variables | on: if no core variables)
-            if (flag_get_auxiliary_variables is None and not parser.core_variables) or flag_get_auxiliary_variables:
-                valid_frame = True
-                for j in parser.auxiliary_variables:
-                    # Special case of frame terminator
-                    if parser.key[j] == 'CRLF_TERMINATOR':
-                        # if rd[j] != 3338:  # unpack('!H', b'\r\n') as data type in calibration file is BU
-                        #     valid_frame = False
-                        continue
-                    elif parser.type[j] == 'TERMINATOR':
-                        # if rd[j] != parser.frame_terminator:
-                        #     valid_frame = False
-                        continue
-                    elif parser.key[j] == 'CHECK_SUM':
+        # Get integration time if available as required from OPTIC3 fit
+        if 'INTTIME' in parser.type:
+            i = parser.type.index('INTTIME')
+            aint = self._fit_data(rd[i], parser.fit_type[i], parser.cal_coefs[i], immersed=parser.immersed)
+        else:
+            aint = None
+        # Core Variables (same data and fit types, serialize process in numpy)
+        if parser.core_variables:
+            d = {parser.core_groupname: self._fit_data(np.array(itemgetter(*parser.core_variables)(rd)),
+                                                       parser.fit_type[parser.core_variables[0]],
+                                                       parser.core_cal_coefs, aint, parser.immersed)}
+        else:
+            d = dict()
+        # Unusable Variables (same data and fit types, serialize process in numpy)
+        if flag_get_unusable_variables and parser.unusable_variables:
+            d[parser.unusable_groupname] = self._fit_data(np.array(itemgetter(*parser.unusable_variables)(rd)),
+                                                          parser.fit_type[parser.unusable_variables[0]],
+                                                          parser.unusable_cal_coefs,
+                                                          aint, parser.immersed)
+        # Auxiliary variables (default: off: if core_variables | on: if no core variables)
+        if (flag_get_auxiliary_variables is None and not parser.core_variables) or flag_get_auxiliary_variables:
+            valid_frame = True
+            for j in parser.auxiliary_variables:
+                # Special case of frame terminator
+                if parser.key[j] == 'CRLF_TERMINATOR':
+                    # if rd[j] != 3338:  # unpack('!H', b'\r\n') as data type in calibration file is BU
+                    #     valid_frame = False
+                    continue
+                elif parser.type[j] == 'TERMINATOR':
+                    # if rd[j] != parser.frame_terminator:
+                    #     valid_frame = False
+                    continue
+                elif parser.key[j] == 'CHECK_SUM':
+                    if not parser.variable_frame_length:
+                        # TODO Check sum to check if variable frame length
                         if rd[j] != self._compute_check_sum(frame, parser.check_sum_index):
                             valid_frame = False
-                    d[parser.key[j]] = self._fit_data(rd[j], parser.fit_type[j], parser.cal_coefs[j], aint,
-                                                      parser.immersed)
-            else:
-                valid_frame = None
+                d[parser.key[j]] = self._fit_data(rd[j], parser.fit_type[j], parser.cal_coefs[j], aint,
+                                                  parser.immersed)
+        else:
+            valid_frame = None
         return d, valid_frame
 
     def _decode_ascii_data(self, value, data_type, force_ascii=False):
         if data_type in ['AS', 'AI', 'AF']:
             try:
-                foo = value.decode(self.ENCODING, self.UNICODE_HANDLING)
+                # Convert from byte to string and remove trailing null byte (comes from C null-terminated character)
+                foo = value.decode(self.ENCODING, self.UNICODE_HANDLING).rstrip('\x00')
             except (UnicodeDecodeError, AttributeError):
                 foo = value
             if data_type == 'AI':
@@ -862,7 +935,7 @@ class SatViewRawToCSV:
             timestamp = datetime.strptime(str(d[0]) + str(d[1]) + '000', '%Y%j%H%M%S%f').strftime(
                 '%Y/%m/%d %H:%M:%S.%f')[:-3]
         except ValueError:
-            print('WARNING: Time Impossible, frame likely corrupted.')
+            warnings.warn('Time Impossible, frame likely corrupted.')
             timestamp = 'NaN'
         # Parse frame data
         try:
@@ -872,7 +945,7 @@ class SatViewRawToCSV:
         except FrameHeaderNotFoundError:
             if frame_header not in self.missing_frame_header:
                 self.missing_frame_header.append(frame_header)
-                print('WARNING: Missing calibration file for: ' + frame_header)
+                warnings.warn(f'Missing calibration file for: {frame_header}')
             return
         except FrameLengthError as e:
             print(e)

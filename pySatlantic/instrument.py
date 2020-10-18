@@ -443,21 +443,31 @@ class Instrument:
     def __init__(self, filename=None, immersed=False):
         self.cal = dict()
         self.max_frame_header_length = 0
-
         if filename is not None:
-            if type(filename) is not list:
-                filename = [filename]
-            for f in filename:
-                if isdir(f):
-                    self.read_calibration_dir(f, immersed)
+            self.read_calibration(filename, immersed)
+
+    def read_calibration(self, filename, immersed=False):
+        """
+        Automatically choose method to read calibration file depending on files extension.
+
+        :param filename: list of calibration files or string of one calibration file
+        :param immersed: False: sensor in air, True: sensor immersed in water
+        :return:
+        """
+
+        if type(filename) is not list:
+            filename = [filename]
+        for f in filename:
+            if isdir(f):
+                self.read_calibration_dir(f, immersed)
+            else:
+                _, ext = splitext(f)
+                if ext in self.VALID_SIP_EXTENSIONS:
+                    self.read_sip_file(f, immersed)
+                elif ext in self.VALID_CAL_EXTENSIONS:
+                    self.read_calibration_file(f, immersed)
                 else:
-                    _, ext = splitext(f)
-                    if ext in self.VALID_SIP_EXTENSIONS:
-                        self.read_sip_file(f, immersed)
-                    elif ext in self.VALID_CAL_EXTENSIONS:
-                        self.read_calibration_file(f, immersed)
-                    else:
-                        raise CalibrationFileExtensionError('File extension incorrect')
+                    raise CalibrationFileExtensionError('File extension incorrect')
 
     def read_calibration_file(self, filename, immersed=False):
         _, ext = splitext(filename)

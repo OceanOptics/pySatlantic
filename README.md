@@ -70,7 +70,7 @@ List of frames and associated calibration files tested:
     + PLD
     + SATBB2F
     + SATFLCD
-  + HyperNav
+  + HyperNAV
     + SATXDZ
     + SATXLZ
     + SATXCZ

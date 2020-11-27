@@ -277,7 +277,12 @@ class Calibration:
                     ls = lc.split()
                     self.frame_header = ls[1]
                     self.frame_header_length = int(ls[3])
-                    self.frame_length += int(ls[3])
+                    self.frame_length += self.frame_header_length
+                    if self.frame_header_length == 10:
+                        if self.instrument == '':
+                            self.instrument = ls[1][0:6]
+                        if self.sn == -999:
+                            self.sn = int(ls[1][6:])
                     continue
                 # Variable frame length separator
                 if lc[0:5] == 'FIELD':
@@ -670,7 +675,7 @@ class Instrument:
                                               frame_header_index)
                 if frame_end_index == -1:
                     # Buffer too short (need to get more data in buffer)
-                    return bytearray(), frame_header, buffer, bytearray()
+                    return bytearray(), None, buffer, bytearray()
                 frame_end_index += len(self.cal[frame_header].frame_terminator_bytes)
                 return buffer[frame_header_index:frame_end_index], frame_header,\
                        buffer[frame_end_index:], buffer[:frame_header_index]
@@ -678,7 +683,7 @@ class Instrument:
                 frame_end_index = frame_header_index + self.cal[frame_header].frame_length
                 if len(buffer) - frame_end_index < 0:
                     # Buffer too short (need to get more data in buffer)
-                    return bytearray(), frame_header, buffer, bytearray()
+                    return bytearray(), None, buffer, bytearray()
                 if self.cal[frame_header].frame_terminator:
                     if buffer[frame_header_index:frame_end_index][-len(self.cal[frame_header].frame_terminator_bytes):] \
                             != self.cal[frame_header].frame_terminator_bytes:
@@ -765,8 +770,8 @@ class Instrument:
     def _decode_ascii_data(self, value, data_type, force_ascii=False):
         if data_type in ['AS', 'AI', 'AF']:
             try:
-                # Convert from byte to string and remove trailing null byte (comes from C null-terminated character)
-                foo = value.decode(self.ENCODING, self.UNICODE_HANDLING).rstrip('\x00')
+                # Convert from byte to string
+                foo = value.decode(self.ENCODING, self.UNICODE_HANDLING)
             except (UnicodeDecodeError, AttributeError):
                 foo = value
             if data_type == 'AI':

@@ -58,6 +58,8 @@ List of frames and associated calibration files tested:
   + HyperSAS
     + HLD
     + HSL
+  + pySAS Tower
+    + UMTWR
   + HTSRB
     + HSD
     + HST
@@ -75,5 +77,10 @@ List of frames and associated calibration files tested:
     + SATXLZ
     + SATXCZ
     + SATYCZ
+  + OCR-504
+    + SATDI4
+  + NMEA
+    + $GPRMC
+    
 
 Some functionalities of the Satlantic protocol are not implemented. Please make a feature request if you would like to the support of specific sensors (through the 'Issues' section of the GitHub repository).

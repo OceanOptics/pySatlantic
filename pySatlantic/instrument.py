@@ -1,12 +1,12 @@
 from __future__ import print_function
 from os import listdir
-from os.path import isfile, join, dirname, splitext, isdir
+from os.path import isfile, join, dirname, splitext, isdir, basename
 from struct import unpack
 import zipfile
 import numpy as np
 import csv
 from operator import itemgetter
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 
 
@@ -32,6 +32,10 @@ class ParserError(SatlanticInstrumentError):
 
 
 class ParserDecodeError(ParserError):
+    pass
+
+
+class ParserTypeError(ParserError):
     pass
 
 
@@ -90,53 +94,16 @@ def sat_dtype_to_np_dtype(sat_data_type, sat_field_length):
         # double float
         return np.float64
     else:
-        raise CalibrationFileError(f'Unknown format decoder {sat_data_type}{sat_field_length}')
+        raise ParserTypeError(f'Unknown format decoder {sat_data_type}{sat_field_length}')
 
 
-def sat_dtype_to_struct_format(sat_data_type, sat_field_length):
-    if sat_field_length is None:
-        raise CalibrationFileError('Field length must be an integer for fix length frames.')
-    if sat_data_type == 'AS':
-        # ASCII string (text)
-        return str(sat_field_length) + 's'
-    elif sat_data_type == 'AI':
-        # ASCII integer number
-        return str(sat_field_length) + 's'
-    elif sat_data_type == 'AF':
-        # ASCII floating point number
-        return str(sat_field_length) + 's'
-    elif sat_data_type == 'BS' and sat_field_length == 1:
-        # signed short 1 byte
-        return 'b'
-    elif sat_data_type == 'BU' and sat_field_length == 1:
-        # unsigned short 1 byte
-        return 'B'
-    elif sat_data_type == 'BS' and sat_field_length == 2:
-        # signed short 2 bytes
-        return 'h'
-    elif sat_data_type == 'BU' and sat_field_length == 2:
-        # unsigned short 2 bytes
-        return 'H'
-    elif sat_data_type == 'BS' and sat_field_length == 4:
-        # signed integer 4 bytes
-        return 'i'
-    elif sat_data_type == 'BU' and sat_field_length == 4:
-        # unsigned integer 4 bytes
-        return 'I'
-    elif sat_data_type == 'BF' and sat_field_length == 4:
-        # float
-        return 'f'
-    elif sat_data_type == 'BD' and sat_field_length == 8:
-        # double float
-        return 'd'
-    else:
-        raise CalibrationFileError(f'Unknown byte decoder {sat_data_type} {sat_field_length}')
-
-class Calibration:
+class Parser:
     """
-    Calibration class for parsing single calibration files
-        get the format of the raw data
-        get the calibration equations and coefficients
+    The Parser class builds a parser from Satlantic Calibration or Telemetry Definition Files (cal or tdf).
+        Parser contains information to unpack binary data or split ascii data into meaningful fields.
+        The Parser also contains information to calibrate fields from engineering units to calibration units
+
+    Follow Satlantic's Data Format Standard SAT-DN-00134, ver 6.1
     """
 
     CORE_VARIABLE_TYPES = ['LT', 'LI', 'LU', 'LD', 'LS', 'ED', 'ES', 'EU', 'EV', 'EF']
@@ -190,7 +157,7 @@ class Calibration:
 
     def read(self, filename):
         """
-        Read filename which is expected to be a .cal file
+        Read calibration or telemetry definition file
 
         .cal file specifications:
               lines ignored:
@@ -248,7 +215,6 @@ class Calibration:
         """
 
         with open(filename, 'r') as f:
-            # for l in f.readlines(): load entire file in memory
             for l in f:  # read file line by line
                 lc = l.strip()  # remove leading and trailing characters
                 if lc == '' or lc[0] == '#':
@@ -279,10 +245,20 @@ class Calibration:
                     self.frame_header_length = int(ls[3])
                     self.frame_length += self.frame_header_length
                     if self.frame_header_length == 10:
-                        if self.instrument == '':
-                            self.instrument = ls[1][0:6]
+                        # Most sensor frame headers are:
+                        #       instrument model: 6 characters (can be char or digit, e.g. SATDI4)
+                        #       serial number: 4 digits
+                        idx = 6
                         if self.sn == -999:
-                            self.sn = int(ls[1][6:])
+                            try:
+                                self.sn = int(ls[1][idx:])
+                            except ValueError:
+                                foo = [c.isdigit() for c in ls[1]]
+                                idx = -foo[-1::-1].index(False)
+                                if idx:
+                                    self.sn = int(ls[1][idx:])
+                        if self.instrument == '':
+                            self.instrument = ls[1][0:idx]
                     continue
                 # Variable frame length separator
                 if lc[0:5] == 'FIELD':
@@ -370,13 +346,28 @@ class Calibration:
                     raise CalibrationFileError('Cal Incomplete line')
 
             if not self.variable_frame_length:
-                # Build frame parser
+                # Build frame parser for fixed length frames
                 self.frame_nfields = len(self.type)
                 for i in range(self.frame_nfields):
                     self.frame_length += self.field_length[i]
-                    self.frame_fmt += sat_dtype_to_struct_format(self.data_type[i], self.field_length[i])
+                    self.frame_fmt += self._sat_dtype_to_struct(self.data_type[i], self.field_length[i])
 
-            # End of check sum computation
+            # Check for variable frame length data type
+            if self.variable_frame_length:
+                for t in self.data_type:
+                    if t not in ['AS', 'AI', 'AF']:
+                        raise ParserTypeError(f"Invalid data type {t} for variable frame length.")
+
+            # Special case of NMEA_CHECKSUM (not documented in SAT-DN-00134)
+            #       data-type should be AI but it's an hexadecimal int instead of int.
+            if 'NMEA_CHECKSUM' in self.key:
+                i = self.key.index('NMEA_CHECKSUM')
+                self.type[i] = 'CHECK'
+                self.id[i] = 'SUM'
+                self.key[i] = f'{self.type}_{self.id}'
+                self.data_type[i] = 'AI16'
+
+            # Specify end of check sum computation
             if not self.variable_frame_length and 'CHECK_SUM' in self.key:
                 self.check_sum_index = -self.field_length[self.key.index('CHECK_SUM')]
                 if 'TERMINATOR' in self.id:
@@ -402,37 +393,77 @@ class Calibration:
             if self.unusable_variables:
                 self.unusable_cal_coefs = np.array(itemgetter(*self.unusable_variables)(self.cal_coefs)).transpose()
 
-            # check for errors
-            if self.variable_frame_length:
-                for t in self.data_type:
-                    if t not in ['AS', 'AI', 'AF']:
-                        raise ValueError('Invalid data_type for Variable frame length.')
+            # Check if data_type is valid for fit type
+            for data, fit in zip(self.data_type, self.fit_type):
+                if fit in ['OPTIC1', 'DDMMYY']:
+                    if data not in ['BU', 'BS', 'AI']:
+                        raise ParserTypeError(f"Valid data types for OPTIC1 are BU, BS, and AI.")
+                elif fit in ['GPSTIME', 'GPSPOS', 'DDMM', 'HHMMSS']:
+                    if data not in ['BF', 'BD', 'AF']:
+                        raise ParserTypeError(f"Valid data types for {fit} are BF, BD, and AF.")
+                elif fit in ['OPTIC2', 'OPTIC3', 'THERM1', 'POW10', 'POLYU', 'POLYF', 'TIME2']:
+                    if data == 'AS':
+                        raise ParserTypeError(f"All data types are valid with {fit}, except AS.")
+                elif fit in ['GPSHEMI', 'GPSMODE', 'GPSSTATUS']:
+                    if data != 'AS':
+                        raise ParserTypeError(f"The only valid data type for {fit} is AS.")
+                elif fit not in ['COUNT', 'NONE', 'DELIMITER']:
+                    raise ParserFitError(f"Fit type {fit} not supported.")
+
+    @staticmethod
+    def _sat_dtype_to_struct(sat_data_type, sat_field_length):
+        if sat_field_length is None:
+            raise CalibrationFileError('Field length must be an integer for fixed length frames.')
+        if sat_data_type == 'AS':
+            # ASCII string (text)
+            return str(sat_field_length) + 's'
+        elif sat_data_type == 'AI':
+            # ASCII integer number
+            return str(sat_field_length) + 's'
+        elif sat_data_type == 'AF':
+            # ASCII floating point number
+            return str(sat_field_length) + 's'
+        elif sat_data_type == 'BS' and sat_field_length == 1:
+            # signed short 1 byte
+            return 'b'
+        elif sat_data_type == 'BU' and sat_field_length == 1:
+            # unsigned short 1 byte
+            return 'B'
+        elif sat_data_type == 'BS' and sat_field_length == 2:
+            # signed short 2 bytes
+            return 'h'
+        elif sat_data_type == 'BU' and sat_field_length == 2:
+            # unsigned short 2 bytes
+            return 'H'
+        elif sat_data_type == 'BS' and sat_field_length == 4:
+            # signed integer 4 bytes
+            return 'i'
+        elif sat_data_type == 'BU' and sat_field_length == 4:
+            # unsigned integer 4 bytes
+            return 'I'
+        elif sat_data_type == 'BF' and sat_field_length == 4:
+            # float
+            return 'f'
+        elif sat_data_type == 'BD' and sat_field_length == 8:
+            # double float
+            return 'd'
+        else:
+            raise ParserTypeError(f'Unknown byte decoder combination {sat_data_type} {sat_field_length}')
 
     def __str__(self):
-        if self.variable_frame_length:
-            return 'Instrument: ' + self.instrument + '\n' + \
-                   'Serial number: ' + str(self.sn) + '\n' + \
-                   'Number of fields: ' + str(self.frame_nfields) + '\n' + \
-                   'Variable frame length: ' + str(self.variable_frame_length) + '\n' + \
-                   'Frame length (in bytes): ' + str(self.frame_length) + '\n' + \
-                   'Variables type: ' + str(self.type) + '\n' + \
-                   'Variables id: ' + str(self.id) + '\n' + \
-                   'Variables units: ' + str(self.units) + '\n' + \
-                   'Variables fit type:' + str(self.fit_type) + '\n' + \
-                   'Variables field separator: ' + str(self.field_separator) + '\n' + \
-                   'Variables data type: ' + str(self.data_type) + '\n'
-        else:
-            return 'Instrument: ' + self.instrument + '\n' + \
-                   'Serial number: ' + str(self.sn) + '\n' + \
-                   'Number of fields: ' + str(self.frame_nfields) + '\n' + \
-                   'Frame length (in bytes): ' + str(self.frame_length) + '\n' + \
-                   'Variables type: ' + str(self.type) + '\n' + \
-                   'Variables id: ' + str(self.id) + '\n' + \
-                   'Variables units: ' + str(self.units) + '\n' + \
-                   'Variables fit type:' + str(self.fit_type) + '\n' + \
-                   'Variables field length: ' + str(self.field_length) + '\n' + \
-                   'Variables data type: ' + str(self.data_type) + '\n' + \
-                   'Variables frame format: ' + str(self.frame_fmt) + '\n'
+        return f'{self.frame_header}\n' + \
+               f'\tInstrument: {self.instrument}\n' + \
+               f'\tSerial number: {self.sn}\n' + \
+               f'\tNumber of fields: {self.frame_nfields}\n' + \
+               f'\tVariable frame length: {self.variable_frame_length}\n' + \
+               f'\tFrame length (in bytes): {self.frame_length}\n' + \
+               f'\tVariables type: {self.type}\n' + \
+               f'\tVariables id: {self.id}\n' + \
+               f'\tVariables units: {self.units}\n' + \
+               f'\tVariables fit type:{self.fit_type}\n' + \
+               f'\tVariables field length: {self.field_length}\n' + \
+               f'\tVariables data type: {self.data_type}\n' + \
+               f'\tVariables frame format: {self.frame_fmt}\n'
 
 
 class Instrument:
@@ -477,7 +508,7 @@ class Instrument:
     def read_calibration_file(self, filename, immersed=False):
         _, ext = splitext(filename)
         if ext in self.VALID_CAL_EXTENSIONS:
-            foo = Calibration(filename, immersed)
+            foo = Parser(filename, immersed)
             self.cal[foo.frame_header] = foo
             self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
         else:
@@ -486,13 +517,12 @@ class Instrument:
     def read_calibration_dir(self, dirname, immersed=False):
         empty_dir = True
         for fn in listdir(dirname):
-            if isfile(join(dirname, fn)):
-                _, ext = splitext(fn)
-                if ext in self.VALID_CAL_EXTENSIONS:
-                    empty_dir = False
-                    foo = Calibration(join(dirname, fn), immersed)
-                    self.cal[foo.frame_header] = foo
-                    self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
+            if isfile(join(dirname, fn)) and splitext(fn)[1] in self.VALID_CAL_EXTENSIONS and basename(fn)[0] != '.':
+                # File exist, valide extension, and not hidden file
+                empty_dir = False
+                foo = Parser(join(dirname, fn), immersed)
+                self.cal[foo.frame_header] = foo
+                self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
         if empty_dir:
             raise CalibrationFileEmptyError('No calibration file found in directory')
 
@@ -502,10 +532,10 @@ class Instrument:
         dirsip = dirname(filename)
         archive.extractall(path=dirsip)
         for fn in archive.namelist():
-            _, ext = splitext(fn)
-            if ext in self.VALID_CAL_EXTENSIONS:
+            if splitext(fn)[1] in self.VALID_CAL_EXTENSIONS and basename(fn)[0] != '.':
+                # Valide extension and not hidden file
                 empty_sip = False
-                foo = Calibration(join(dirsip, fn), immersed)
+                foo = Parser(join(dirsip, fn), immersed)
                 self.cal[foo.frame_header] = foo
                 self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
         if empty_sip:
@@ -696,18 +726,25 @@ class Instrument:
             return bytearray(), None, bytearray(), buffer
 
     def parse_frame(self, frame, frame_header=None, flag_get_auxiliary_variables=None, flag_get_unusable_variables=False):
-        try:
-            if not frame_header:
-                # get frame_header (only works for frame header of size 10, most Satlantic frame headers)
-                frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
-            parser = self.cal[frame_header]
-        except KeyError:
-            raise FrameHeaderNotFoundError('Unable to find frame header in loaded calibration files')
+        if not frame_header:
+            # Attempt to guess frame header from Standard 10 caracters SAT headers
+            frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
+            if frame_header not in self.cal.keys():
+                # Attempt to find one of the know frame header
+                frame_header = None
+                for fh in self.cal.keys():
+                    fhi = frame.find(bytes(fh, self.ENCODING))
+                    if fhi == 0:
+                        frame_header = fh
+                        break
+                if not frame_header:
+                    raise FrameHeaderNotFoundError('Frame header not found or parser missing.')
+        parser = self.cal[frame_header]
         if parser.variable_frame_length:
             # Variable length frame
             rd = list()
             # Decode value of each field
-            frame = frame[11:].decode(self.ENCODING, self.UNICODE_HANDLING)  # skip first value separator (comma)
+            frame = frame[parser.frame_header_length+1:].decode(self.ENCODING, self.UNICODE_HANDLING)  # skip first value separator (comma)
             for s, t in zip(parser.field_separator[1:], parser.data_type[:-1]):
                 index_sep = frame.find(s)
                 if index_sep == -1:
@@ -747,19 +784,24 @@ class Instrument:
         if (flag_get_auxiliary_variables is None and not parser.core_variables) or flag_get_auxiliary_variables:
             valid_frame = True
             for j in parser.auxiliary_variables:
-                # Special case of frame terminator
+                # Special fields
                 if parser.key[j] == 'CRLF_TERMINATOR':
-                    # if rd[j] != 3338:  # unpack('!H', b'\r\n') as data type in calibration file is BU
-                    #     valid_frame = False
+                    if not parser.variable_frame_length:
+                        if rd[j] != 3338:  # unpack('!H', b'\r\n') as data type in calibration file is BU
+                            valid_frame = False
                     continue
                 elif parser.type[j] == 'TERMINATOR':
-                    # if rd[j] != parser.frame_terminator:
-                    #     valid_frame = False
+                    if not parser.variable_frame_length:
+                        if rd[j] != parser.frame_terminator:
+                            valid_frame = False
                     continue
                 elif parser.key[j] == 'CHECK_SUM':
-                    if not parser.variable_frame_length:
-                        # TODO Check sum to check if variable frame length
-                        if rd[j] != self._compute_check_sum(frame, parser.check_sum_index):
+                    if parser.variable_frame_length:
+                        # if rd[j] != self.compute_nmea_check_sum(frame):
+                        #     valid_frame = False
+                        pass
+                    else:
+                        if rd[j] != self.compute_check_sum(frame, parser.check_sum_index):
                             valid_frame = False
                 d[parser.key[j]] = self._fit_data(rd[j], parser.fit_type[j], parser.cal_coefs[j], aint,
                                                   parser.immersed)
@@ -768,7 +810,7 @@ class Instrument:
         return d, valid_frame
 
     def _decode_ascii_data(self, value, data_type, force_ascii=False):
-        if data_type in ['AS', 'AI', 'AF']:
+        if data_type in ['AS', 'AI', 'AI16', 'AF']:
             try:
                 # Convert from byte to string
                 foo = value.decode(self.ENCODING, self.UNICODE_HANDLING)
@@ -776,6 +818,8 @@ class Instrument:
                 foo = value
             if data_type == 'AI':
                 return int(foo)
+            elif data_type == 'AI16':
+                return int(foo, 16)
             elif data_type == 'AF':
                 return float(foo)
             return foo
@@ -785,7 +829,25 @@ class Instrument:
 
     @staticmethod
     def _fit_data(value, fit_type, cal_coefs, aint=None, immersed=False):
-        if fit_type == 'POLYU':
+        if fit_type == 'OPTIC2':
+            # Special factored polynomial with one gain range. For optical sensors only.
+            a0, a1, im = cal_coefs
+            im = im if immersed else 1.0
+            return im * a1 * (value - a0)
+            # return (value - sc_coefs[0]) * sc_coefs[1]
+        elif fit_type == 'OPTIC3':
+            # Special factored polynomial with one linearly adaptive gain range. For optical sensors only.
+            # aint = integration time (INTTIME)
+            a0, a1, im, cint = cal_coefs
+            im = im if immersed else 1.0
+            return im * a1 * (value - a0) * (cint / aint)
+            # return (value - sc_coefs[0]) * sc_coefs[1] / aint
+        elif fit_type == 'POW10':
+            # Special exponential equation for logarithmic sensors.
+            a0, a1, im = cal_coefs
+            im = im if immersed else 1.0
+            return im * 10 ** ((value - a0)/a1)
+        elif fit_type == 'POLYU':
             # Un-factored polynomial
             foo = 0
             for k in range(len(cal_coefs)):
@@ -797,30 +859,96 @@ class Instrument:
             for k in range(1, len(cal_coefs)):
                 foo *= value - cal_coefs[k]
             return foo
-        elif fit_type == 'OPTIC2':
-            a0 = cal_coefs[0]
-            a1 = cal_coefs[1]
-            im = cal_coefs[2] if immersed else 1.0
-            return im * a1 * (value - a0)
-            # return (value - sc_coefs[0]) * sc_coefs[1]
-        elif fit_type == 'OPTIC3':
-            # aint = integration time (INTTIME)
-            a0 = cal_coefs[0]
-            a1 = cal_coefs[1]
-            im = cal_coefs[2] if immersed else 1.0
-            cint = cal_coefs[3]
-            return im * a1 * (value - a0) * (cint / aint)
-            # return (value - sc_coefs[0]) * sc_coefs[1] / aint
-        elif fit_type in ['NONE', 'COUNT']:
+        elif fit_type == 'GPSTIME':
+            # Universal Coordinated Time of GPS data.
+            # value format is hhmmss.s
+            # return decimal hours
+            hh = int(value/10000)
+            mm = int((value-hh*10000) / 100)
+            ss = value - hh*10000 - mm*100
+            return hh + mm / 60 + ss / 3600
+        elif fit_type == 'GPSPOS':
+            # GPS global position.
+            # value format is dddmm.m
+            # return decimal degrees
+            d = int(value/100)
+            m = value-d*100
+            return d + m / 60
+        elif fit_type == 'GPSHEMI':
+            # GPS global position hemisphere.
+            # value format is N, E, S, W
+            return 1.0 if value in ['N', 'E'] else -1.0 if value in ['S', 'W'] else 0.0
+        elif fit_type == 'GPSMODE':
+            # GPS Positioning System Mode Indicator.
+            if value == 'A':
+                return 1.0
+            elif value == 'D':
+                return 2.0
+            elif value == 'E':
+                return 3.0
+            elif value == 'M':
+                return 4.0
+            elif value == 'S':
+                return 5.0
+            elif value == 'N':
+                return 6.0
+            else:
+                return 0.0
+        elif fit_type == 'GPSSTATUS':
+            # GPS system status.
+            return True if value == 'A' else False
+        elif fit_type == 'DDMM':
+            # GPS global position in degrees, minutes, and seconds.
+            d = int(value / 100)
+            m = int(value - d * 100)
+            s = int(((value - d * 100) - m) * 60)
+            return f'{d} {m}\' {s}\'\''
+        elif fit_type == 'HHMMSS':
+            # Universal Coordinated Time of GPS data in hours, minutes, and seconds.
+            # DIVERGE FROM SATLANTIC SPECIFICATIONS CONVERT TO PYTHON timedelta
+            hh = int(value / 10000)
+            mm = int((value - hh * 10000) / 100)
+            ss = value - hh * 10000 - mm * 100
+            return timedelta(hours=hh, minutes=mm, seconds=ss)
+        elif fit_type == 'DDMMYY':
+            # GPS date of global position.
+            # DIVERGE FROM SATLANTIC SPECIFICATIONS CONVERT TO PYTHON datetime
+            dd = int(value / 10000)
+            mm = int((value - dd * 10000) / 100)
+            yy = int(value - dd * 10000 - mm * 100)
+            return datetime(yy, mm, dd)
+        elif fit_type == 'TIME2':
+            # Time tag for the frame.
+            dt = datetime.utcfromtimestamp(value)
+            return dt.strftime('%y-%m-%d %H.%M.%S')
+        elif fit_type == 'COUNT':
+            # Raw or un-calibrated information.
             return value
+        elif fit_type == 'NONE':
+            # Unusable data. (Used if frame data is to be ignored)
+            # warnings('Fit type processing should not be applied to a NONE sensor.')
+            return None
         else:
-            raise ParserFitError("Parser fit type not supported '" + fit_type + "'")
+            raise ParserFitError(f"Fit type {fit_type} not supported.")
 
     @staticmethod
-    def _compute_check_sum(frame, check_sum_index=-3):
+    def compute_check_sum(frame, check_sum_index=-3):
         # Last byte of the sum of all bytes substracted from 0
         #   from frame header (included) to checksum (excluded)
         return np.uint8(0 - sum(frame[0:check_sum_index]))
+
+    def compute_nmea_check_sum(self, frame, start_index=1, end_index=-5):
+        """
+        Compute checksum for NMEA frames
+        :param frame:
+        :param start_index:
+        :param end_index:
+        :return:
+        """
+        checksum = 0
+        for s in frame[1:-5].decode(self.ENCODING, self.UNICODE_HANDLING):
+            checksum ^= ord(s)
+        return checksum
 
     def __str__(self):
         foo = ""
@@ -853,7 +981,7 @@ class SatViewRawToCSV:
     # REGISTRATION = b'SAT'
     READ_SIZE = 1024
 
-    def __init__(self, calibration_filename, raw_filename, immersed=False):
+    def __init__(self, calibration_filename, raw_filename=None, immersed=False):
         self.buffer = bytearray()
         self.frame_buffer = bytearray()
         self.w = dict()
@@ -862,32 +990,34 @@ class SatViewRawToCSV:
         self.frame_unregistered = 0
         self.missing_frame_header = []
         self.instrument = Instrument(calibration_filename, immersed)
-        [filename, _] = splitext(raw_filename)
-        for k, cal in self.instrument.cal.items():
-            self.w[k] = CSVWriter()
-            disp_key = cal.key.copy()
-            disp_aux_var = cal.auxiliary_variables.copy()
-            if 'TERMINATOR' in cal.key:
-                del disp_aux_var[disp_aux_var.index(disp_key.index('TERMINATOR'))]
-                del disp_key[disp_key.index('TERMINATOR')]
-            elif 'CRLF_TERMINATOR' in cal.key:
-                del disp_aux_var[disp_aux_var.index(disp_key.index('CRLF_TERMINATOR'))]
-                del disp_key[disp_key.index('CRLF_TERMINATOR')]
-            if cal.core_variables:
-                fieldnames = ['TIMESTAMP'] + list(itemgetter(*cal.core_variables)(disp_key)) + \
-                             list(itemgetter(*disp_aux_var)(disp_key))
-            else:
-                fieldnames = ['TIMESTAMP'] + disp_key
-            self.w[k].open(filename + '_' + k + '.csv', fieldnames)
-        self.run(raw_filename)
+        if raw_filename:
+            self.run(raw_filename)
 
     def run(self, filename):
         with open(filename, 'rb') as f:
+            # Open output csv files
+            [filename, _] = splitext(filename)
+            for k, cal in self.instrument.cal.items():
+                self.w[k] = CSVWriter()
+                disp_key = cal.key.copy()
+                disp_aux_var = cal.auxiliary_variables.copy()
+                if 'TERMINATOR' in cal.key:
+                    del disp_aux_var[disp_aux_var.index(disp_key.index('TERMINATOR'))]
+                    del disp_key[disp_key.index('TERMINATOR')]
+                elif 'CRLF_TERMINATOR' in cal.key:
+                    del disp_aux_var[disp_aux_var.index(disp_key.index('CRLF_TERMINATOR'))]
+                    del disp_key[disp_key.index('CRLF_TERMINATOR')]
+                if cal.core_variables:
+                    fieldnames = ['TIMESTAMP'] + list(itemgetter(*cal.core_variables)(disp_key)) + \
+                                 list(itemgetter(*disp_aux_var)(disp_key))
+                else:
+                    fieldnames = ['TIMESTAMP'] + disp_key
+                self.w[k].open(filename + '_' + k + '.csv', fieldnames)
+            # Parse data
             data = f.read(self.READ_SIZE)
             while data:
                 self.data_read(data)
                 data = f.read(self.READ_SIZE)
-            # self.last_data_read()
 
     # Method using check frame (less elegant)
     # def data_read(self, data):
@@ -989,5 +1119,6 @@ class SatViewRawToCSV:
         self.w[frame_header].write([timestamp] + data)
 
     def __del__(self):
-        for k in self.w.keys():
-            self.w[k].close()
+        if hasattr(self, 'w'):
+            for k in self.w.keys():
+                self.w[k].close()

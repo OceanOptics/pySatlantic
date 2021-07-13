@@ -1,13 +1,13 @@
 from __future__ import print_function
-from os import listdir
-from os.path import isfile, join, dirname, splitext, isdir, basename
+import os
 from struct import unpack
 import zipfile
 import numpy as np
 import csv
 from operator import itemgetter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import warnings
+from collections import namedtuple
 
 
 # Error Management
@@ -53,6 +53,9 @@ class CalibrationFileExtensionError(CalibrationFileError):
 
 class CalibrationFileEmptyError(CalibrationFileError):
     pass
+
+
+FrameContainer = namedtuple('FrameContainer', ['header', 'data', 'timestamp', 'valid'])
 
 
 def sat_dtype_to_np_dtype(sat_data_type, sat_field_length):
@@ -494,10 +497,10 @@ class Instrument:
         if type(filename) is not list:
             filename = [filename]
         for f in filename:
-            if isdir(f):
+            if os.path.isdir(f):
                 self.read_calibration_dir(f, immersed)
             else:
-                _, ext = splitext(f)
+                ext = os.path.splitext(f)[1]
                 if ext in self.VALID_SIP_EXTENSIONS:
                     self.read_sip_file(f, immersed)
                 elif ext in self.VALID_CAL_EXTENSIONS:
@@ -506,7 +509,7 @@ class Instrument:
                     raise CalibrationFileExtensionError('File extension incorrect')
 
     def read_calibration_file(self, filename, immersed=False):
-        _, ext = splitext(filename)
+        ext = os.path.splitext(filename)[1]
         if ext in self.VALID_CAL_EXTENSIONS:
             foo = Parser(filename, immersed)
             self.cal[foo.frame_header] = foo
@@ -516,11 +519,12 @@ class Instrument:
 
     def read_calibration_dir(self, dirname, immersed=False):
         empty_dir = True
-        for fn in listdir(dirname):
-            if isfile(join(dirname, fn)) and splitext(fn)[1] in self.VALID_CAL_EXTENSIONS and basename(fn)[0] != '.':
+        for fn in os.listdir(dirname):
+            if os.path.isfile(os.path.join(dirname, fn)) and \
+                    os.path.splitext(fn)[1] in self.VALID_CAL_EXTENSIONS and os.path.basename(fn)[0] != '.':
                 # File exist, valide extension, and not hidden file
                 empty_dir = False
-                foo = Parser(join(dirname, fn), immersed)
+                foo = Parser(os.path.join(dirname, fn), immersed)
                 self.cal[foo.frame_header] = foo
                 self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
         if empty_dir:
@@ -529,13 +533,13 @@ class Instrument:
     def read_sip_file(self, filename, immersed=False):
         empty_sip = True
         archive = zipfile.ZipFile(filename, 'r')
-        dirsip = dirname(filename)
+        dirsip = os.path.dirname(filename)
         archive.extractall(path=dirsip)
         for fn in archive.namelist():
-            if splitext(fn)[1] in self.VALID_CAL_EXTENSIONS and basename(fn)[0] != '.':
+            if os.path.splitext(fn)[1] in self.VALID_CAL_EXTENSIONS and os.path.basename(fn)[0] != '.':
                 # Valide extension and not hidden file
                 empty_sip = False
-                foo = Parser(join(dirsip, fn), immersed)
+                foo = Parser(os.path.join(dirsip, fn), immersed)
                 self.cal[foo.frame_header] = foo
                 self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
         if empty_sip:
@@ -727,7 +731,7 @@ class Instrument:
 
     def parse_frame(self, frame, frame_header=None, flag_get_auxiliary_variables=None, flag_get_unusable_variables=False):
         if not frame_header:
-            # Attempt to guess frame header from Standard 10 caracters SAT headers
+            # Attempt to guess frame header from Standard 10 characters SAT headers
             frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
             if frame_header not in self.cal.keys():
                 # Attempt to find one of the know frame header
@@ -950,6 +954,85 @@ class Instrument:
             checksum ^= ord(s)
         return checksum
 
+    def read_satview(self, filename, **kwargs):
+        """
+        Read SatView raw file
+        Assume frame is valid if parse_frame return valid=None
+
+        :param filename: SatView file to read
+        :param kwargs: key word arguments for parse_frame
+        :param debug: display unknown bytes and unknown frames
+        :return: list of FrameContainers, metadata dictionary
+        """
+        data = []
+        ignored_bytes, invalid_timestamps = 0, 0
+        valid_frames, invalid_frames = dict(), dict()
+        sathdr_present = False
+        with open(filename, 'rb') as f:
+            buffer = bytearray(f.read(32768))
+            while buffer:
+                frame = True
+                while frame or unknown_bytes:
+                    # Get Frame
+                    frame, frame_header, buffer, unknown_bytes = self.find_frame(buffer)
+                    if unknown_bytes:
+                        if unknown_bytes[:6] == b'SATHDR':
+                            sathdr_present = True
+                        else:
+                            # print(unknown_bytes)
+                            ignored_bytes += len(unknown_bytes)
+                            if frame_header and not frame:
+                                if frame_header not in invalid_frames.keys():
+                                    invalid_frames[frame_header] = 1
+                                else:
+                                    invalid_frames[frame_header] += 1
+                    if frame:
+                        if len(buffer) >= 7:
+                            # Get SatView timestamp
+                            ts = buffer[:7]
+                            buffer = buffer[7:]
+                            # Parse timestamp
+                            ts = unpack('!ii', b'\x00' + ts)
+                            try:
+                                timestamp = datetime.strptime(f'{ts[0]}{ts[1]:09d}000', '%Y%j%H%M%S%f')
+                            except ValueError as e:
+                                warnings.warn('Time Impossible, frame likely corrupted.')
+                                timestamp = 'NaN'
+                                invalid_timestamps += 1
+                            # Calibrate frame
+                            parsed_frame, valid = self.parse_frame(frame, frame_header, **kwargs)
+                            if valid == True or valid is None:
+                                data.append(FrameContainer(header=frame_header, data=parsed_frame,
+                                                           timestamp=timestamp, valid=valid))
+                                if frame_header not in valid_frames.keys():
+                                    valid_frames[frame_header] = 1
+                                else:
+                                    valid_frames[frame_header] += 1
+                            else:
+                                if frame_header not in invalid_frames.keys():
+                                    # print(frame)
+                                    invalid_frames[frame_header] = 1
+                                else:
+                                    invalid_frames[frame_header] += 1
+                        else:
+                            # Missing data to read timestamp from SatView
+                            # Refill buffer and go grab more data
+                            buffer = frame + buffer
+                            break
+                tmp_buffer = f.read(32768)
+                if tmp_buffer:
+                    buffer.extend(tmp_buffer)
+                else:
+                    break
+        # Read metadata from file
+        stat = os.stat(filename)
+        meta = dict(file_name=os.path.basename(filename), file_size=stat.st_size,
+                    file_created=datetime.utcfromtimestamp(stat.st_ctime).replace(tzinfo=timezone.utc),
+                    file_modified=datetime.utcfromtimestamp(stat.st_mtime).replace(tzinfo=timezone.utc),
+                    sathdr_present=sathdr_present, valid_frames=valid_frames, invalid_frames=invalid_frames,
+                    invalid_timestamps=invalid_timestamps, ignored_bytes=ignored_bytes)
+        return data, meta
+
     def __str__(self):
         foo = ""
         for c in self.cal.values():
@@ -996,7 +1079,7 @@ class SatViewRawToCSV:
     def run(self, filename):
         with open(filename, 'rb') as f:
             # Open output csv files
-            [filename, _] = splitext(filename)
+            [filename, _] = os.path.splitext(filename)
             for k, cal in self.instrument.cal.items():
                 self.w[k] = CSVWriter()
                 disp_key = cal.key.copy()
@@ -1018,6 +1101,9 @@ class SatViewRawToCSV:
             while data:
                 self.data_read(data)
                 data = f.read(self.READ_SIZE)
+            # Close files
+            for k in self.instrument.cal.keys():
+                self.w[k].close()
 
     # Method using check frame (less elegant)
     # def data_read(self, data):

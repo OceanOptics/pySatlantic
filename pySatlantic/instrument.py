@@ -109,7 +109,7 @@ class Parser:
     Follow Satlantic's Data Format Standard SAT-DN-00134, ver 6.1
     """
 
-    CORE_VARIABLE_TYPES = ['LT', 'LI', 'LU', 'LD', 'LS', 'ED', 'ES', 'EU', 'EV', 'EF']
+    CORE_VARIABLE_TYPES = ['LT', 'LI', 'LU', 'LD', 'LS', 'ED', 'ES', 'EU', 'EV', 'EF', 'UV']
 
     def __init__(self, cal_filename=None, immersed=False):
         # Metadata
@@ -499,14 +499,16 @@ class Instrument:
         for f in filename:
             if os.path.isdir(f):
                 self.read_calibration_dir(f, immersed)
-            else:
+            elif os.path.isfile(f):
                 ext = os.path.splitext(f)[1]
                 if ext in self.VALID_SIP_EXTENSIONS:
                     self.read_sip_file(f, immersed)
                 elif ext in self.VALID_CAL_EXTENSIONS:
                     self.read_calibration_file(f, immersed)
                 else:
-                    raise CalibrationFileExtensionError('File extension incorrect')
+                    raise CalibrationFileExtensionError(f'File extension incorrect: {f}')
+            else:
+                raise FileNotFoundError(f'No such file or directory: {f}')
 
     def read_calibration_file(self, filename, immersed=False):
         ext = os.path.splitext(filename)[1]
@@ -515,7 +517,7 @@ class Instrument:
             self.cal[foo.frame_header] = foo
             self.max_frame_header_length = max(self.max_frame_header_length, len(foo.frame_header))
         else:
-            raise CalibrationFileExtensionError('File extension incorrect')
+            raise CalibrationFileExtensionError(f'File extension incorrect: {f}')
 
     def read_calibration_dir(self, dirname, immersed=False):
         empty_dir = True
@@ -729,7 +731,7 @@ class Instrument:
             # No frame found
             return bytearray(), None, bytearray(), buffer
 
-    def parse_frame(self, frame, frame_header=None, flag_get_auxiliary_variables=None, flag_get_unusable_variables=False):
+    def parse_frame(self, frame, frame_header=None, *args, **kwargs):
         if not frame_header:
             # Attempt to guess frame header from Standard 10 characters SAT headers
             frame_header = frame[0:10].decode(self.ENCODING, self.UNICODE_HANDLING)
@@ -744,46 +746,56 @@ class Instrument:
                 if not frame_header:
                     raise FrameHeaderNotFoundError('Frame header not found or parser missing.')
         parser = self.cal[frame_header]
+        raw_decoded = self.decode(frame, parser)
+        return self.calibrate(raw_decoded, parser, frame, *args, **kwargs)
+
+    @staticmethod
+    def decode(frame, parser):
         if parser.variable_frame_length:
             # Variable length frame
             rd = list()
             # Decode value of each field
-            frame = frame[parser.frame_header_length+1:].decode(self.ENCODING, self.UNICODE_HANDLING)  # skip first value separator (comma)
+            frame = frame[parser.frame_header_length + 1:].decode(Instrument.ENCODING,
+                                                                  Instrument.UNICODE_HANDLING)  # skip first value separator (comma)
             for s, t in zip(parser.field_separator[1:], parser.data_type[:-1]):
                 index_sep = frame.find(s)
                 if index_sep == -1:
                     valid_frame = False
                     continue
-                rd.append(self._decode_ascii_data(frame[0:index_sep], t, force_ascii=True))
+                rd.append(Instrument._decode_ascii_data(frame[0:index_sep], t, force_ascii=True))
                 frame = frame[index_sep + 1:]
         else:
             # Fixed length frame
             # Decode binary data
             if parser.frame_length != len(frame):
                 raise FrameLengthError('Unexpected frame length: %s expected %d actual %d' %
-                                       (frame_header, parser.frame_length, len(frame)))
+                                       (parser.frame_header, parser.frame_length, len(frame)))
             rd = unpack(parser.frame_fmt, frame[10:])
             # Decode ASCII variables
-            rd = [self._decode_ascii_data(v, t) for v, t in zip(rd, parser.data_type)]
+            rd = [Instrument._decode_ascii_data(v, t) for v, t in zip(rd, parser.data_type)]
+        return rd
+
+    @staticmethod
+    def calibrate(rd, parser, frame=None, flag_get_auxiliary_variables=None, flag_get_unusable_variables=False):
         # Get integration time if available as required from OPTIC3 fit
         if 'INTTIME' in parser.type:
             i = parser.type.index('INTTIME')
-            aint = self._fit_data(rd[i], parser.fit_type[i], parser.cal_coefs[i], immersed=parser.immersed)
+            aint = Instrument._fit_data(rd[i], parser.fit_type[i], parser.cal_coefs[i], immersed=parser.immersed)
         else:
             aint = None
         # Core Variables (same data and fit types, serialize process in numpy)
         if parser.core_variables:
-            d = {parser.core_groupname: self._fit_data(np.array(itemgetter(*parser.core_variables)(rd)),
-                                                       parser.fit_type[parser.core_variables[0]],
-                                                       parser.core_cal_coefs, aint, parser.immersed)}
+            d = {parser.core_groupname: Instrument._fit_data(np.array(itemgetter(*parser.core_variables)(rd)),
+                                                             parser.fit_type[parser.core_variables[0]],
+                                                             parser.core_cal_coefs, aint, parser.immersed)}
         else:
             d = dict()
         # Unusable Variables (same data and fit types, serialize process in numpy)
         if flag_get_unusable_variables and parser.unusable_variables:
-            d[parser.unusable_groupname] = self._fit_data(np.array(itemgetter(*parser.unusable_variables)(rd)),
-                                                          parser.fit_type[parser.unusable_variables[0]],
-                                                          parser.unusable_cal_coefs,
-                                                          aint, parser.immersed)
+            d[parser.unusable_groupname] = Instrument._fit_data(np.array(itemgetter(*parser.unusable_variables)(rd)),
+                                                                parser.fit_type[parser.unusable_variables[0]],
+                                                                parser.unusable_cal_coefs,
+                                                                aint, parser.immersed)
         # Auxiliary variables (default: off: if core_variables | on: if no core variables)
         if (flag_get_auxiliary_variables is None and not parser.core_variables) or flag_get_auxiliary_variables:
             valid_frame = True
@@ -804,20 +816,21 @@ class Instrument:
                         # if rd[j] != self.compute_nmea_check_sum(frame):
                         #     valid_frame = False
                         pass
-                    else:
-                        if rd[j] != self.compute_check_sum(frame, parser.check_sum_index):
+                    elif frame is not None:
+                        if rd[j] != Instrument.compute_check_sum(frame, parser.check_sum_index):
                             valid_frame = False
-                d[parser.key[j]] = self._fit_data(rd[j], parser.fit_type[j], parser.cal_coefs[j], aint,
-                                                  parser.immersed)
+                d[parser.key[j]] = Instrument._fit_data(rd[j], parser.fit_type[j], parser.cal_coefs[j], aint,
+                                                        parser.immersed)
         else:
             valid_frame = None
         return d, valid_frame
 
-    def _decode_ascii_data(self, value, data_type, force_ascii=False):
+    @staticmethod
+    def _decode_ascii_data(value, data_type, force_ascii=False):
         if data_type in ['AS', 'AI', 'AI16', 'AF']:
             try:
                 # Convert from byte to string
-                foo = value.decode(self.ENCODING, self.UNICODE_HANDLING)
+                foo = value.decode(Instrument.ENCODING, Instrument.UNICODE_HANDLING)
             except (UnicodeDecodeError, AttributeError):
                 foo = value
             if data_type == 'AI':
@@ -1172,7 +1185,8 @@ class SatViewRawToCSV:
         try:
             if not frame_header:
                 frame_header = frame[0:10].decode(self.instrument.ENCODING, self.instrument.UNICODE_HANDLING)
-            [parsed_frame, valid_frame] = self.instrument.parse_frame(frame, frame_header, True)
+            [parsed_frame, valid_frame] = self.instrument.parse_frame(frame, frame_header,
+                                                                      flag_get_auxiliary_variables=True)
         except FrameHeaderNotFoundError:
             if frame_header not in self.missing_frame_header:
                 self.missing_frame_header.append(frame_header)

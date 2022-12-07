@@ -69,6 +69,7 @@ class TestHyperSASFunctions(unittest.TestCase):
     def test_read_frame_fixed_length(self):
         from pySatlantic import instrument
         i = instrument.Instrument(TEST_CALIBRATION_SIP_FILE, immersed=True)
+        i.__str__()
         # Test older version
         d_v0 = i.parse_frame_v0(TEST_FRAME_FIXED_LENGTH)
         self.assertCountEqual(d_v0, TEST_FRAME_FIXED_LENGTH_DICT_v0)
